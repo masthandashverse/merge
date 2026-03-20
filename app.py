@@ -242,6 +242,14 @@ def set_progress(batch_id, ep_idx, pct, msg, status='processing'):
             'status': status, 'ts': time.time()}
 
 
+def set_ep_done(batch_id, ep_idx, result):
+    """Mark a single episode as done within a batch."""
+    with jobs_lock:
+        if batch_id not in jobs:
+            jobs[batch_id] = {}
+        jobs[batch_id][f'ep_{ep_idx}_final'] = result
+
+
 def set_done(batch_id, results, dl_folder):
     with jobs_lock:
         jobs[batch_id]['_final'] = {
@@ -432,16 +440,11 @@ def method_soft_mp4(video, sub, out_mp4, work_dir):
 # ── Core processor ────────────────────────────────────────────
 def process_episode(video_path, srt_path, ep_name, merge_type,
                     batch_id, ep_idx, dl_folder):
-    """
-    Encodes/muxes DIRECTLY into dl_folder.
-    No intermediate copy — zero extra disk usage.
-    """
     work_dir = None
     out_file = None
     try:
         set_progress(batch_id, ep_idx, 2, 'Starting…')
 
-        # ── Validate inputs ───────────────────────────────
         if not os.path.isfile(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
         if not os.path.isfile(srt_path):
@@ -472,11 +475,9 @@ def process_episode(video_path, srt_path, ep_name, merge_type,
 
         os.makedirs(dl_folder, exist_ok=True)
 
-        # ── HARD SUBTITLES — output directly to dl_folder ─
         if merge_type == 'hard':
             out_name = f'{safe}.mp4'
             out_file = _unique_dest(dl_folder, out_name)
-
             set_progress(batch_id, ep_idx, 10,
                          f'Encoding with {encoder}…')
 
@@ -507,7 +508,6 @@ def process_episode(video_path, srt_path, ep_name, merge_type,
                     last_err = (result.stderr[-300:]
                                 if result and result.stderr
                                 else 'no output')
-                    # Remove failed partial output
                     if os.path.exists(out_file):
                         os.remove(out_file)
                 except Exception as ex:
@@ -520,16 +520,13 @@ def process_episode(video_path, srt_path, ep_name, merge_type,
                 raise RuntimeError(
                     f"All hard-sub methods failed.\n{last_err[:300]}")
 
-        # ── SOFT SUBTITLES — output directly to dl_folder ─
         else:
             success  = False
             last_err = ''
-
             set_progress(batch_id, ep_idx, 15,
                          'Soft sub (stream copy)…')
 
-            # Try MKV first
-            out_mkv  = _unique_dest(dl_folder, f'{safe}.mkv')
+            out_mkv = _unique_dest(dl_folder, f'{safe}.mkv')
             try:
                 r, out_mkv = method_soft_mkv(
                     video_path, srt_path, out_mkv, sub_ext)
@@ -548,7 +545,6 @@ def process_episode(video_path, srt_path, ep_name, merge_type,
                 if os.path.exists(out_mkv):
                     os.remove(out_mkv)
 
-            # Fallback to MP4
             if not success:
                 set_progress(batch_id, ep_idx, 40,
                              'Trying MP4 soft sub…')
@@ -574,7 +570,6 @@ def process_episode(video_path, srt_path, ep_name, merge_type,
                 raise RuntimeError(
                     f"Soft-sub failed: {last_err[:300]}")
 
-        # ── Done ─────────────────────────────────────────
         size_mb = os.path.getsize(out_file) / 1024 / 1024
         set_progress(batch_id, ep_idx, 100,
                      f'✅ Done! {size_mb:.1f} MB', 'completed')
@@ -591,7 +586,6 @@ def process_episode(video_path, srt_path, ep_name, merge_type,
         import traceback
         traceback.print_exc()
         msg = str(exc)
-        # Clean up any partial output
         if out_file and os.path.exists(out_file):
             try:
                 os.remove(out_file)
@@ -607,7 +601,6 @@ def process_episode(video_path, srt_path, ep_name, merge_type,
 
 
 def _unique_dest(folder, filename):
-    """Return a path that doesn't collide with existing files."""
     dest = os.path.join(folder, filename)
     if not os.path.exists(dest):
         return dest
@@ -643,47 +636,30 @@ def path_preset(name):
 
 @app.route('/browse_folder', methods=['POST'])
 def browse_folder():
-    """
-    Open a native OS folder-picker dialog and return the chosen path.
-    Falls back gracefully if no GUI is available (headless server).
-    """
     try:
         import tkinter as tk
         from tkinter import filedialog
-
-        # Get suggested starting directory from request
-        data        = request.get_json(force=True) or {}
-        start_dir   = data.get('start_dir', str(Path.home()))
-        start_dir   = os.path.expanduser(start_dir)
+        data      = request.get_json(force=True) or {}
+        start_dir = data.get('start_dir', str(Path.home()))
+        start_dir = os.path.expanduser(start_dir)
         if not os.path.isdir(start_dir):
             start_dir = str(Path.home())
-
         root = tk.Tk()
-        root.withdraw()           # Hide the root window
-        root.attributes('-topmost', True)   # Bring picker to front
+        root.withdraw()
+        root.attributes('-topmost', True)
         root.update()
-
         chosen = filedialog.askdirectory(
-            parent=root,
-            title='Choose output folder',
-            initialdir=start_dir,
-            mustexist=False)
-
+            parent=root, title='Choose output folder',
+            initialdir=start_dir, mustexist=False)
         root.destroy()
-
         if not chosen:
             return jsonify({'cancelled': True})
-
-        # Validate / create chosen folder
         norm, err = validate_save_path(chosen)
         if err:
             return jsonify({'error': err})
         return jsonify({'path': norm})
-
     except ImportError:
-        return jsonify({
-            'error': 'tkinter not available on this server. '
-                     'Please type the path manually.'})
+        return jsonify({'error': 'tkinter not available on this server.'})
     except Exception as ex:
         return jsonify({'error': f'Folder picker error: {ex}'})
 
@@ -719,6 +695,64 @@ def validate_path_route():
     return jsonify({'valid': True, 'resolved': norm, 'writable': True})
 
 
+# ── Single episode merge ──────────────────────────────────────
+@app.route('/merge_single', methods=['POST'])
+def merge_single():
+    """Merge one episode independently — used by per-card merge button."""
+    try:
+        if not check_ffmpeg():
+            return jsonify({'error': 'FFmpeg not installed'}), 500
+
+        merge_type = request.form.get('merge_type', 'hard')
+        save_path  = request.form.get('save_path', '').strip()
+        ep_name    = request.form.get('ep_name', 'Episode').strip()
+
+        dl_folder, path_err = validate_save_path(save_path)
+        if path_err:
+            return jsonify({'error': f'Invalid save path: {path_err}'}), 400
+
+        vf = request.files.get('video')
+        sf = request.files.get('srt')
+        if not vf or not vf.filename or not sf or not sf.filename:
+            return jsonify({'error': 'Video and subtitle files required'}), 400
+
+        batch_id   = uuid.uuid4().hex[:8]
+        upload_dir = tempfile.mkdtemp(prefix=f'single_{batch_id}_')
+
+        v_ext  = Path(vf.filename).suffix.lower() or '.mp4'
+        s_ext  = Path(sf.filename).suffix.lower() or '.srt'
+        v_path = os.path.join(upload_dir, f'video{v_ext}')
+        s_path = os.path.join(upload_dir, f'srt{s_ext}')
+        vf.save(v_path)
+        sf.save(s_path)
+
+        with jobs_lock:
+            jobs[batch_id] = {
+                'ep_0': {'pct': 0, 'msg': 'Queued…',
+                         'status': 'queued', 'ts': time.time()},
+                '_meta': {'save_path': dl_folder, 'ep_count': 1}
+            }
+
+        def run_single():
+            r = process_episode(v_path, s_path, ep_name,
+                                merge_type, batch_id, 0, dl_folder)
+            set_done(batch_id, [r], dl_folder)
+            shutil.rmtree(upload_dir, ignore_errors=True)
+
+        threading.Thread(target=run_single, daemon=True).start()
+
+        return jsonify({
+            'batch_id':  batch_id,
+            'save_path': dl_folder
+        })
+
+    except Exception as ex:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(ex)}), 500
+
+
+# ── Batch merge ───────────────────────────────────────────────
 @app.route('/merge', methods=['POST'])
 def merge():
     try:
@@ -744,7 +778,6 @@ def merge():
                 {'error': f'Invalid save path: {path_err}'}), 400
 
         batch_id   = uuid.uuid4().hex[:8]
-        # Temp dir only for uploaded source files — deleted after processing
         upload_dir = tempfile.mkdtemp(prefix=f'upload_{batch_id}_')
 
         episodes = []
@@ -776,8 +809,7 @@ def merge():
 
         if not episodes:
             shutil.rmtree(upload_dir, ignore_errors=True)
-            return jsonify(
-                {'error': 'No valid episodes'}), 400
+            return jsonify({'error': 'No valid episodes'}), 400
 
         with jobs_lock:
             jobs[batch_id] = {
@@ -797,7 +829,6 @@ def merge():
                     merge_type, batch_id, i, dl_folder)
                 results.append(r)
             set_done(batch_id, results, dl_folder)
-            # Delete uploaded source files — output already in dl_folder
             shutil.rmtree(upload_dir, ignore_errors=True)
             print(f"[Batch {batch_id}] Cleaned upload temp dir")
 
@@ -848,8 +879,6 @@ def progress_stream(batch_id):
             'Connection':       'keep-alive'})
 
 
-# NOTE: /download route kept for compatibility but files are already
-# saved directly to the user's chosen folder — no server copy exists.
 @app.route('/download/<batch_id>/<int:ep_idx>')
 def download(batch_id, ep_idx):
     with jobs_lock:
@@ -866,8 +895,7 @@ def download(batch_id, ep_idx):
                              as_attachment=True,
                              download_name=fname,
                              mimetype=mime)
-    return jsonify({'error': 'File not found — '
-                             'check your output folder directly'}), 404
+    return jsonify({'error': 'File not found'}), 404
 
 
 @app.errorhandler(413)
